@@ -1,525 +1,589 @@
 import os
 import re
-import decimal
+import json
+import uuid
+import asyncio
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import asyncpg
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.filters import Command
-from dotenv import load_dotenv
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-load_dotenv()
+# -----------------------------
+# Config
+# -----------------------------
+DEFAULT_MEMBERS = ["AVC", "PC", "AS", "SS", "VH", "KA"]
+DEFAULT_CURRENCY = "AED"
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not TOKEN or not DATABASE_URL:
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN and DATABASE_URL env vars")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-AMT = decimal.Decimal
+# Global DB pool (optional)
+DB_POOL: Optional[asyncpg.pool.Pool] = None
 
-WEIGHT_WORDS = {
-    "double": AMT("2"),
-    "twice": AMT("2"),
-    "triple": AMT("3"),
-    "thrice": AMT("3"),
-}
+
+# -----------------------------
+# Helpers: text parsing
+# -----------------------------
+AMOUNT_RE = re.compile(r"(?P<amt>\d+(\.\d{1,2})?)")
+PAID_BY_RE = re.compile(r"\b(?P<payer>[A-Za-z]{1,10})\s+paid\b|\bpaid\s+by\s+(?P<payer2>[A-Za-z]{1,10})\b", re.IGNORECASE)
+
+EXCLUDE_RE = re.compile(r"\b(except|excluding|besides)\b", re.IGNORECASE)
+DOUBLE_RE = re.compile(r"\b(double|2x|two\s*x)\b", re.IGNORECASE)
+TRIPLE_RE = re.compile(r"\b(triple|3x|three\s*x)\b", re.IGNORECASE)
+
+SPLIT_ALL_RE = re.compile(r"\b(split|split it|split this|split by|split among|split between)\b", re.IGNORECASE)
+EVERYONE_RE = re.compile(r"\b(everyone|all|all of us)\b", re.IGNORECASE)
+
+UNDO_RE = re.compile(r"^\s*undo(\s+(?P<what>last|\d+))?\s*$", re.IGNORECASE)
+
+# Clean member tokens like "PC," "pc." -> "PC"
+def norm_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", "", s).upper()
+
+
+def extract_amount(text: str) -> Optional[float]:
+    # pick the first number as amount
+    m = AMOUNT_RE.search(text)
+    if not m:
+        return None
+    try:
+        return float(m.group("amt"))
+    except:
+        return None
+
+
+def extract_payer(text: str) -> Optional[str]:
+    m = PAID_BY_RE.search(text)
+    if not m:
+        return None
+    payer = m.group("payer") or m.group("payer2")
+    if not payer:
+        return None
+    return norm_name(payer)
+
+
+def extract_exclusions(text: str) -> List[str]:
+    # Look for: "except D" / "excluding D and KA" / "besides PC"
+    # Basic heuristic: after exclusion keyword, collect tokens that look like names
+    m = EXCLUDE_RE.search(text)
+    if not m:
+        return []
+    tail = text[m.end():]
+    tokens = re.split(r"[,\s]+|and", tail, flags=re.IGNORECASE)
+    names = []
+    for t in tokens:
+        n = norm_name(t)
+        if n and len(n) <= 10:
+            names.append(n)
+    return list(dict.fromkeys(names))  # unique preserve order
+
+
+def extract_multipliers(text: str) -> Dict[str, float]:
+    """
+    Examples:
+    - "double the shares for D"
+    - "double share for PC"
+    - "triple share for SS"
+    We'll scan for patterns "... for <NAME>" near 'double/triple'
+    """
+    out: Dict[str, float] = {}
+
+    # double ... for X
+    for mult_word, mult_val in [("double", 2.0), ("triple", 3.0)]:
+        # capture "double ... for D" or "double share for D"
+        pattern = re.compile(rf"\b{mult_word}\b.*?\bfor\s+([A-Za-z]{{1,10}})\b", re.IGNORECASE)
+        for m in pattern.finditer(text):
+            name = norm_name(m.group(1))
+            if name:
+                out[name] = mult_val
+
+    # "2x for D"
+    pattern2 = re.compile(r"\b(2x|3x)\b.*?\bfor\s+([A-Za-z]{1,10})\b", re.IGNORECASE)
+    for m in pattern2.finditer(text):
+        mult = 2.0 if m.group(1).lower() == "2x" else 3.0
+        name = norm_name(m.group(2))
+        if name:
+            out[name] = mult
+
+    return out
+
+
+def extract_participants_explicit(text: str) -> List[str]:
+    """
+    If user says "split between PC and AS" or "split among PC, AS, SS"
+    We'll collect tokens after split keywords.
+    """
+    if not SPLIT_ALL_RE.search(text):
+        return []
+
+    # If "everyone" present, don't treat as explicit list
+    if EVERYONE_RE.search(text):
+        return []
+
+    # Take tail after "split"
+    m = SPLIT_ALL_RE.search(text)
+    tail = text[m.end():] if m else text
+    tokens = re.split(r"[,\s]+|and", tail, flags=re.IGNORECASE)
+    names = []
+    for t in tokens:
+        n = norm_name(t)
+        # heuristic: short tokens likely names
+        if n and len(n) <= 10 and not n.isdigit():
+            names.append(n)
+    # de-dupe
+    names = list(dict.fromkeys(names))
+    return names
+
 
 @dataclass
 class ParsedExpense:
+    amount: float
     payer: str
-    amount: AMT
-    currency: str
+    participants: List[str]
+    weights: Dict[str, float]
     note: str
-    participants: List[str]  # includes Guest:xxx
-    weights: Dict[str, AMT]
-    confidence: float
+    currency: str = DEFAULT_CURRENCY
 
-AMOUNT_RE = re.compile(r"(\d+(?:\.\d{1,2})?)")
-ALL_WORDS = re.compile(r"\b(all|everyone|everybody)\b", re.IGNORECASE)
-EXCEPT_RE = re.compile(r"\b(except|besides|excluding)\b\s+(.+)$", re.IGNORECASE)
-GUEST_RE = re.compile(r"\bguest\b\s+([A-Za-z0-9_-]{2,32})", re.IGNORECASE)
 
-WEIGHT_PATTERNS = [
-    re.compile(r"\b(?P<name>[A-Za-z]{2,5})\s*(?:=|:)\s*(?P<w>\d+(?:\.\d+)?)\b", re.IGNORECASE),
-    re.compile(r"\b(?P<name>[A-Za-z]{2,5})\s*(?P<w>\d+(?:\.\d+)?)\s*x\b", re.IGNORECASE),
-    re.compile(r"\b(?P<name>[A-Za-z]{2,5})\s*x\s*(?P<w>\d+(?:\.\d+)?)\b", re.IGNORECASE),
-    re.compile(r"\b(?P<name>[A-Za-z]{2,5})\s*(?P<word>double|twice|triple|thrice)\b", re.IGNORECASE),
-    re.compile(r"\b(?P<word>double|twice|triple|thrice)\s*(?P<name>[A-Za-z]{2,5})\b", re.IGNORECASE),
-]
+def parse_expense_text(text: str, default_members: List[str]) -> Tuple[Optional[ParsedExpense], str]:
+    """
+    Returns (ParsedExpense or None, error_message_if_any)
+    """
+    raw = text.strip()
 
-def norm_code(s: str) -> str:
-    return s.strip().upper()
+    amt = extract_amount(raw)
+    if amt is None:
+        return None, "I could not find an amount. Example: `PC paid 120 split by everyone`"
 
-def norm_guest(name: str) -> str:
-    name = name.strip().replace(" ", "_").lower()
-    return f"Guest:{name}"
+    payer = extract_payer(raw)
+    if payer is None:
+        # fallback: if message starts with a name token
+        first = norm_name(raw.split()[0]) if raw.split() else ""
+        payer = first if first else None
 
-def compute_shares(amount: AMT, participants: List[str], weights: Dict[str, AMT]) -> Dict[str, AMT]:
-    total_w = sum(weights[p] for p in participants)
-    raw = {p: (amount * weights[p] / total_w) for p in participants}
-    rounded = {p: raw[p].quantize(AMT("0.01")) for p in participants}
-    diff = amount - sum(rounded.values())
-    cents = int((diff * 100).to_integral_value(rounding=decimal.ROUND_HALF_UP))
-    if cents != 0:
-        order = sorted(participants, key=lambda p: (raw[p] - rounded[p]), reverse=(cents > 0))
-        step = AMT("0.01") if cents > 0 else AMT("-0.01")
-        for i in range(abs(cents)):
-            rounded[order[i % len(order)]] += step
+    if payer is None:
+        return None, "I could not find who paid. Example: `PC paid 120 split by everyone`"
+
+    # Determine base participants
+    explicit = extract_participants_explicit(raw)
+    exclusions = extract_exclusions(raw)
+    multipliers = extract_multipliers(raw)
+
+    everyone = bool(EVERYONE_RE.search(raw)) or bool(re.search(r"\beveryone\b", raw, re.IGNORECASE))
+    if explicit:
+        participants = explicit
+    elif everyone:
+        participants = list(default_members)
+    else:
+        # Default: split among default members
+        participants = list(default_members)
+
+    # Include payer by default (you requested). Ensure payer is in participants.
+    if payer not in participants:
+        participants.append(payer)
+
+    # Apply exclusions
+    participants = [p for p in participants if p not in exclusions]
+
+    # Allow "guest" / non-members:
+    # If text contains extra short names not in default list, treat them as additional participants.
+    # Example: "split by everyone and GUEST1" or "with John"
+    possible_names = re.findall(r"\b[A-Za-z]{1,10}\b", raw)
+    for token in possible_names:
+        n = norm_name(token)
+        if not n:
+            continue
+        # ignore common words
+        if n.lower() in {
+            "PAID", "SPLIT", "BY", "EVERYONE", "ALL", "EXCEPT", "EXCLUDING", "BESIDES",
+            "DOUBLE", "TRIPLE", "SHARE", "SHARES", "FOR", "AND", "AED"
+        }:
+            continue
+        # keep if looks like an ID-ish name and not a number
+        if n.isdigit():
+            continue
+        # If user explicitly mentions someone not in default list and not payer keyword etc, add as participant
+        # Only add if the message contains "with" or "including" or explicit list was detected
+        if n not in participants and (explicit or re.search(r"\b(with|including|include)\b", raw, re.IGNORECASE)):
+            participants.append(n)
+
+    if len(participants) < 1:
+        return None, "Participants list became empty after exclusions. Try again."
+
+    # Weights
+    weights = {p: 1.0 for p in participants}
+    for name, mult in multipliers.items():
+        if name in weights:
+            weights[name] = mult
+
+    note = raw
+    return ParsedExpense(amount=amt, payer=payer, participants=participants, weights=weights, note=note), ""
+
+
+# -----------------------------
+# DB layer (optional)
+# -----------------------------
+SCHEMA_SQL = """
+create table if not exists groups (
+  group_id bigint primary key,
+  title text,
+  currency text not null default 'AED',
+  created_at timestamptz not null default now()
+);
+
+create table if not exists members (
+  group_id bigint not null,
+  name text not null,
+  created_at timestamptz not null default now(),
+  primary key (group_id, name),
+  foreign key (group_id) references groups(group_id) on delete cascade
+);
+
+create table if not exists expenses (
+  id bigserial primary key,
+  group_id bigint not null,
+  payer text not null,
+  amount numeric not null,
+  currency text not null default 'AED',
+  note text,
+  created_by bigint,
+  created_at timestamptz not null default now(),
+  is_deleted boolean not null default false,
+  foreign key (group_id) references groups(group_id) on delete cascade
+);
+
+create table if not exists expense_splits (
+  expense_id bigint not null,
+  participant text not null,
+  weight numeric not null default 1,
+  share_amount numeric not null,
+  created_at timestamptz not null default now(),
+  primary key (expense_id, participant),
+  foreign key (expense_id) references expenses(id) on delete cascade
+);
+"""
+
+
+async def init_db_pool() -> None:
+    global DB_POOL
+    if not DATABASE_URL:
+        print("DATABASE_URL not set. Running without DB.")
+        DB_POOL = None
+        return
+
+    try:
+        DB_POOL = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            timeout=10,
+        )
+        async with DB_POOL.acquire() as conn:
+            await conn.execute(SCHEMA_SQL)
+        print("DB connected and schema ensured.")
+    except Exception as e:
+        print(f"DB connection failed. Running without DB. Error: {e}")
+        DB_POOL = None
+
+
+async def ensure_group_defaults(group_id: int, title: str, members: List[str]) -> None:
+    if DB_POOL is None:
+        return
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "insert into groups(group_id, title, currency) values($1,$2,$3) on conflict (group_id) do update set title=excluded.title",
+            group_id, title, DEFAULT_CURRENCY
+        )
+        for m in members:
+            await conn.execute(
+                "insert into members(group_id, name) values($1,$2) on conflict do nothing",
+                group_id, m
+            )
+
+
+def compute_shares(amount: float, participants: List[str], weights: Dict[str, float]) -> Dict[str, float]:
+    total_w = sum(weights.get(p, 1.0) for p in participants)
+    if total_w <= 0:
+        total_w = float(len(participants))
+    raw = {p: (weights.get(p, 1.0) / total_w) * amount for p in participants}
+
+    # Rounding to 2 decimals and adjust drift
+    rounded = {p: round(v, 2) for p, v in raw.items()}
+    drift = round(amount - sum(rounded.values()), 2)
+    if abs(drift) >= 0.01:
+        # add drift to payer if present, else first participant
+        target = participants[0]
+        rounded[target] = round(rounded[target] + drift, 2)
     return rounded
 
-def settlement_suggestions(net: Dict[str, AMT]) -> List[Tuple[str, str, AMT]]:
-    creditors = [(n, v) for n, v in net.items() if v > 0]
-    debtors = [(n, -v) for n, v in net.items() if v < 0]
+
+async def db_insert_expense(group_id: int, created_by: int, parsed: ParsedExpense) -> int:
+    assert DB_POOL is not None
+    shares = compute_shares(parsed.amount, parsed.participants, parsed.weights)
+    async with DB_POOL.acquire() as conn:
+        async with conn.transaction():
+            exp_id = await conn.fetchval(
+                "insert into expenses(group_id, payer, amount, currency, note, created_by) values($1,$2,$3,$4,$5,$6) returning id",
+                group_id, parsed.payer, parsed.amount, parsed.currency, parsed.note, created_by
+            )
+            for p in parsed.participants:
+                await conn.execute(
+                    "insert into expense_splits(expense_id, participant, weight, share_amount) values($1,$2,$3,$4)",
+                    exp_id, p, parsed.weights.get(p, 1.0), shares[p]
+                )
+            return int(exp_id)
+
+
+async def db_undo(group_id: int, exp_id: int) -> bool:
+    if DB_POOL is None:
+        return False
+    async with DB_POOL.acquire() as conn:
+        res = await conn.execute(
+            "update expenses set is_deleted=true where id=$1 and group_id=$2 and is_deleted=false",
+            exp_id, group_id
+        )
+        # asyncpg returns "UPDATE <n>"
+        return res.startswith("UPDATE ") and not res.endswith(" 0")
+
+
+async def db_last_expense_id(group_id: int) -> Optional[int]:
+    if DB_POOL is None:
+        return None
+    async with DB_POOL.acquire() as conn:
+        return await conn.fetchval(
+            "select id from expenses where group_id=$1 and is_deleted=false order by id desc limit 1",
+            group_id
+        )
+
+
+async def db_balance(group_id: int) -> Dict[str, float]:
+    """
+    Net balance per person:
+    + means they should receive money
+    - means they owe money
+    """
+    if DB_POOL is None:
+        return {}
+
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("""
+            select e.payer as name,
+                   sum(e.amount)::numeric as paid
+            from expenses e
+            where e.group_id=$1 and e.is_deleted=false
+            group by e.payer
+        """, group_id)
+
+        paid_map = {r["name"]: float(r["paid"]) for r in rows}
+
+        rows2 = await conn.fetch("""
+            select s.participant as name,
+                   sum(s.share_amount)::numeric as owed
+            from expenses e
+            join expense_splits s on s.expense_id=e.id
+            where e.group_id=$1 and e.is_deleted=false
+            group by s.participant
+        """, group_id)
+
+        owed_map = {r["name"]: float(r["owed"]) for r in rows2}
+
+    names = set(paid_map.keys()) | set(owed_map.keys())
+    net = {}
+    for n in names:
+        net[n] = round(paid_map.get(n, 0.0) - owed_map.get(n, 0.0), 2)
+    return dict(sorted(net.items(), key=lambda x: (-x[1], x[0])))
+
+
+def settlement_suggestions(net: Dict[str, float]) -> List[Tuple[str, str, float]]:
+    """
+    Greedy settlement: debtors pay creditors.
+    """
+    creditors = [(n, amt) for n, amt in net.items() if amt > 0.01]
+    debtors = [(n, -amt) for n, amt in net.items() if amt < -0.01]
+
     creditors.sort(key=lambda x: x[1], reverse=True)
     debtors.sort(key=lambda x: x[1], reverse=True)
 
     i = j = 0
-    pays: List[Tuple[str, str, AMT]] = []
+    transfers = []
     while i < len(debtors) and j < len(creditors):
         d_name, d_amt = debtors[i]
         c_name, c_amt = creditors[j]
-        x = min(d_amt, c_amt).quantize(AMT("0.01"))
-        if x > 0:
-            pays.append((d_name, c_name, x))
-        d_amt -= x
-        c_amt -= x
+        x = min(d_amt, c_amt)
+        x = round(x, 2)
+        if x >= 0.01:
+            transfers.append((d_name, c_name, x))
+        d_amt = round(d_amt - x, 2)
+        c_amt = round(c_amt - x, 2)
         debtors[i] = (d_name, d_amt)
         creditors[j] = (c_name, c_amt)
-        if debtors[i][1] <= AMT("0.00001"):
+        if debtors[i][1] <= 0.01:
             i += 1
-        if creditors[j][1] <= AMT("0.00001"):
+        if creditors[j][1] <= 0.01:
             j += 1
-    return pays
+    return transfers
 
-async def ensure_group(conn: asyncpg.Connection, chat_id: int) -> int:
-    row = await conn.fetchrow("select id from groups where tg_chat_id=$1", chat_id)
-    if row:
-        return row["id"]
-    row = await conn.fetchrow("insert into groups(tg_chat_id) values($1) returning id", chat_id)
-    return row["id"]
 
-async def upsert_user_member(conn: asyncpg.Connection, group_id: int, tg_user_id: int, display_code: str) -> int:
-    row = await conn.fetchrow(
-        """
-        insert into members(group_id, tg_user_id, display_code, is_guest)
-        values($1,$2,$3,false)
-        on conflict (group_id, tg_user_id)
-        do update set display_code=excluded.display_code, is_active=true, is_guest=false
-        returning id
-        """,
-        group_id, tg_user_id, display_code
+# -----------------------------
+# Telegram handlers
+# -----------------------------
+def is_group_chat(update: Update) -> bool:
+    return update.effective_chat and update.effective_chat.type in ("group", "supergroup")
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not chat:
+        return
+    await ensure_group_defaults(chat.id, chat.title or "Untitled", DEFAULT_MEMBERS)
+
+    db_status = "connected" if DB_POOL is not None else "NOT connected"
+    members = ", ".join(DEFAULT_MEMBERS)
+
+    msg = (
+        f"Fracta is online.\n"
+        f"DB: {db_status}\n\n"
+        f"Default members: {members}\n\n"
+        "Examples:\n"
+        "- `PC paid 120 split by everyone`\n"
+        "- `AVC paid 80 split by everyone except SS`\n"
+        "- `AS paid 210 split by everyone besides VH and double the shares for PC`\n\n"
+        "Commands:\n"
+        "- `/balance`\n"
+        "- `undo last` or `undo 123`\n"
     )
-    return row["id"]
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-async def get_member_by_code(conn: asyncpg.Connection, group_id: int, code: str):
-    return await conn.fetchrow(
-        "select id, display_code, is_guest from members where group_id=$1 and lower(display_code)=lower($2) and is_active=true",
-        group_id, code
-    )
 
-async def get_or_create_guest(conn: asyncpg.Connection, group_id: int, guest_code: str) -> int:
-    row = await get_member_by_code(conn, group_id, guest_code)
-    if row:
-        return row["id"]
-    row = await conn.fetchrow(
-        """
-        insert into members(group_id, tg_user_id, display_code, is_guest)
-        values($1, null, $2, true)
-        returning id
-        """,
-        group_id, guest_code
-    )
-    return row["id"]
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not chat:
+        return
 
-async def list_member_codes(conn: asyncpg.Connection, group_id: int) -> List[str]:
-    rows = await conn.fetch(
-        "select display_code from members where group_id=$1 and is_active=true and is_guest=false order by id",
-        group_id
-    )
-    return [r["display_code"] for r in rows]
+    if DB_POOL is None:
+        await update.message.reply_text("DB is down. I cannot compute balance yet.")
+        return
 
-async def compute_net_positions(conn: asyncpg.Connection, group_id: int) -> Dict[str, AMT]:
-    rows = await conn.fetch(
-        """
-        with paid as (
-          select payer_member_id as mid, sum(amount) as paid
-          from expenses
-          where group_id=$1 and currency='AED'
-          group by payer_member_id
-        ),
-        owed as (
-          select es.member_id as mid, sum(es.share_amount) as owed
-          from expense_splits es
-          join expenses e on e.id=es.expense_id
-          where e.group_id=$1 and e.currency='AED'
-          group by es.member_id
-        )
-        select m.display_code,
-               coalesce(p.paid,0)::numeric as paid,
-               coalesce(o.owed,0)::numeric as owed
-        from members m
-        left join paid p on p.mid=m.id
-        left join owed o on o.mid=m.id
-        where m.group_id=$1 and m.is_active=true
-        """,
-        group_id
-    )
-    out: Dict[str, AMT] = {}
-    for r in rows:
-        out[r["display_code"]] = AMT(str(r["paid"])) - AMT(str(r["owed"]))
-    return out
+    net = await db_balance(chat.id)
+    if not net:
+        await update.message.reply_text("No expenses recorded yet.")
+        return
 
-def parse_loose_english(text: str, known_members: List[str]) -> ParsedExpense:
-    t = text.strip()
-    known = {norm_code(x) for x in known_members}
+    lines = ["Balances ( + receive, - owe ):"] + [f"- {n}: {amt:.2f} {DEFAULT_CURRENCY}" for n, amt in net.items()]
+    transfers = settlement_suggestions(net)
+    if transfers:
+        lines.append("\nSuggested settlements:")
+        for d, c, x in transfers[:10]:
+            lines.append(f"- {d} -> {c}: {x:.2f} {DEFAULT_CURRENCY}")
+        if len(transfers) > 10:
+            lines.append(f"(+{len(transfers)-10} more)")
+    await update.message.reply_text("\n".join(lines))
 
-    # payer: first token matching known member
-    payer = None
-    for tok in re.split(r"\s+", t)[:6]:
-        c = norm_code(re.sub(r"[^\w]", "", tok))
-        if c in known:
-            payer = c
-            break
-    if not payer:
-        raise ValueError("Could not find payer. Start with one of: " + ", ".join(sorted(known)))
 
-    m_amt = AMOUNT_RE.search(t)
-    if not m_amt:
-        raise ValueError("Could not find amount. Example: 'AVC paid 95 taxi split all'")
-    amount = AMT(m_amt.group(1))
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
 
-    currency = "AED"
+    text = update.message.text or ""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
 
-    # guests
-    guests = [norm_guest(g) for g in GUEST_RE.findall(t)]
+    # Ensure defaults in DB if available
+    await ensure_group_defaults(chat.id, chat.title or "Untitled", DEFAULT_MEMBERS)
 
-    # exclusions
-    excluded = set()
-    m_exc = EXCEPT_RE.search(t)
-    if m_exc:
-        tail = m_exc.group(2)
-        for code in re.findall(r"\b[A-Za-z]{2,5}\b", tail):
-            c = norm_code(code)
-            if c in known:
-                excluded.add(c)
-        for g in re.findall(r"\bguest\b\s+([A-Za-z0-9_-]{2,32})", tail, re.IGNORECASE):
-            excluded.add(norm_guest(g))
-
-    # participants base
-    if ALL_WORDS.search(t):
-        participants = list(sorted(known))
-        confidence = 0.9
-    else:
-        mentioned = []
-        for code in re.findall(r"\b[A-Za-z]{2,5}\b", t):
-            c = norm_code(code)
-            if c in known and c not in mentioned:
-                mentioned.append(c)
-        participants = mentioned if len(mentioned) >= 2 else list(sorted(known))
-        confidence = 0.75
-
-    # include payer by default
-    if payer not in participants:
-        participants.append(payer)
-
-    # add guests
-    for g in guests:
-        if g not in participants:
-            participants.append(g)
-
-    # weights
-    weights: Dict[str, AMT] = {p: AMT("1") for p in participants}
-    weighted_explicit = set()
-
-    for pat in WEIGHT_PATTERNS:
-        for m in pat.finditer(t):
-            name = m.groupdict().get("name")
-            word = m.groupdict().get("word")
-            wnum = m.groupdict().get("w")
-
-            target = None
-            if name:
-                c = norm_code(name)
-                if c in known:
-                    target = c
-            if target is None and name and name.lower().startswith("guest:"):
-                target = name
-
-            if target:
-                if wnum:
-                    weights[target] = AMT(wnum)
-                    weighted_explicit.add(target)
-                elif word and word.lower() in WEIGHT_WORDS:
-                    weights[target] = WEIGHT_WORDS[word.lower()]
-                    weighted_explicit.add(target)
-
-    # apply exclusions, but keep explicitly weighted people
-    final_participants = []
-    for p in participants:
-        if p in excluded and p not in weighted_explicit:
-            continue
-        final_participants.append(p)
-
-    if not final_participants:
-        raise ValueError("No participants after exclusions.")
-
-    note = t
-    return ParsedExpense(
-        payer=payer,
-        amount=amount,
-        currency=currency,
-        note=note,
-        participants=final_participants,
-        weights={p: weights.get(p, AMT("1")) for p in final_participants},
-        confidence=float(confidence),
-    )
-
-async def main():
-    bot = Bot(TOKEN)
-    dp = Dispatcher()
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-
-    @dp.message(Command("help"))
-    async def help_cmd(message: Message):
-        await message.reply(
-            "Commands:\n"
-            "/join\n"
-            "/me AVC (or PC/AS/SS/VH/KA)\n"
-            "/guest Driver\n"
-            "/list 10\n"
-            "/delete last | /delete <id>\n"
-            "/undo\n"
-            "/balance\n\n"
-            "Log expenses by typing:\n"
-            "AVC paid 420 dinner split everyone VH double guest driver\n"
-            "PC 95 taxi split all except KA\n"
-        )
-
-    @dp.message(Command("start"))
-    async def start_cmd(message: Message):
-        await help_cmd(message)
-
-    @dp.message(Command("join"))
-    async def join_cmd(message: Message):
-        async with pool.acquire() as conn:
-            gid = await ensure_group(conn, message.chat.id)
-            # default code until /me
-            code = message.from_user.username or str(message.from_user.id)
-            code = norm_code(code)[:5]
-            await upsert_user_member(conn, gid, message.from_user.id, code)
-        await message.reply("Joined. Now set your code: /me AVC (or PC/AS/SS/VH/KA)")
-
-    @dp.message(Command("me"))
-    async def me_cmd(message: Message):
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply("Usage: /me AVC")
-            return
-        code = norm_code(parts[1])
-        async with pool.acquire() as conn:
-            gid = await ensure_group(conn, message.chat.id)
-            await upsert_user_member(conn, gid, message.from_user.id, code)
-        await message.reply(f"Code set to {code}")
-
-    @dp.message(Command("guest"))
-    async def guest_cmd(message: Message):
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply("Usage: /guest Driver")
-            return
-        guest_code = norm_guest(parts[1])
-        async with pool.acquire() as conn:
-            gid = await ensure_group(conn, message.chat.id)
-            mid = await get_or_create_guest(conn, gid, guest_code)
-        await message.reply(f"Guest ready: {guest_code} (id {mid})")
-
-    @dp.message(Command("list"))
-    async def list_cmd(message: Message):
-        n = 10
-        parts = message.text.split()
-        if len(parts) >= 2 and parts[1].isdigit():
-            n = min(50, max(1, int(parts[1])))
-
-        async with pool.acquire() as conn:
-            gid = await ensure_group(conn, message.chat.id)
-            rows = await conn.fetch(
-                """
-                select id, amount, currency, note, created_at
-                from expenses
-                where group_id=$1
-                order by created_at desc
-                limit $2
-                """,
-                gid, n
-            )
-
-        if not rows:
-            await message.reply("No expenses yet.")
+    # Undo handling
+    um = UNDO_RE.match(text)
+    if um:
+        if DB_POOL is None:
+            await update.message.reply_text("DB is down. Undo is unavailable.")
             return
 
-        lines = ["Last expenses:"]
-        for r in rows:
-            note = (r["note"] or "").strip()
-            note = note[:60] + ("..." if len(note) > 60 else "")
-            lines.append(f"- #{r['id']}: {r['amount']} {r['currency']} | {note} | {r['created_at']:%Y-%m-%d %H:%M}")
-        await message.reply("\n".join(lines))
-
-    @dp.message(Command("delete"))
-    async def delete_cmd(message: Message):
-        parts = message.text.split()
-        if len(parts) < 2:
-            await message.reply("Usage: /delete last  OR  /delete <expense_id>")
-            return
-        target = parts[1].lower()
-
-        async with pool.acquire() as conn:
-            gid = await ensure_group(conn, message.chat.id)
-
-            if target == "last":
-                row = await conn.fetchrow(
-                    """
-                    select id, amount, currency, note, created_at
-                    from expenses
-                    where group_id=$1
-                    order by created_at desc
-                    limit 1
-                    """,
-                    gid
-                )
-            else:
-                if not target.isdigit():
-                    await message.reply("Usage: /delete last  OR  /delete <expense_id>")
-                    return
-                row = await conn.fetchrow(
-                    """
-                    select id, amount, currency, note, created_at
-                    from expenses
-                    where group_id=$1 and id=$2
-                    """,
-                    gid, int(target)
-                )
-
-            if not row:
-                await message.reply("Nothing found to delete.")
+        what = um.group("what")
+        if not what or what.lower() == "last":
+            exp_id = await db_last_expense_id(chat.id)
+            if not exp_id:
+                await update.message.reply_text("No expenses to undo.")
                 return
-
-            exp_id = row["id"]
-            await conn.execute("delete from expenses where group_id=$1 and id=$2", gid, exp_id)
-
-        note = (row["note"] or "").strip()
-        note = note[:60] + ("..." if len(note) > 60 else "")
-        await message.reply(
-            f"Deleted Expense #{exp_id}: {row['amount']} {row['currency']} | {note} | {row['created_at']:%Y-%m-%d %H:%M}"
-        )
-
-    @dp.message(Command("undo"))
-    async def undo_cmd(message: Message):
-        message.text = "/delete last"
-        await delete_cmd(message)
-
-    @dp.message(Command("balance"))
-    async def balance_cmd(message: Message):
-        async with pool.acquire() as conn:
-            gid = await ensure_group(conn, message.chat.id)
-            net = await compute_net_positions(conn, gid)
-
-        lines = ["Balances (net, AED):"]
-        for n, v in sorted(net.items()):
-            sign = "+" if v >= 0 else "-"
-            lines.append(f"- {n}: {sign}{abs(v).quantize(AMT('0.01'))} AED")
-
-        pays = settlement_suggestions(net)
-        if pays:
-            lines.append("Suggested settlements:")
-            for d, c, x in pays:
-                lines.append(f"- {d} -> {c}: {x} AED")
         else:
-            lines.append("All settled.")
-        await message.reply("\n".join(lines))
+            exp_id = int(what)
 
-    @dp.message(F.text)
-    async def handle_text(message: Message):
-        text = (message.text or "").strip()
-        if text.startswith("/"):
-            return
+        ok = await db_undo(chat.id, exp_id)
+        await update.message.reply_text("Undone." if ok else "Could not undo (not found or already undone).")
+        return
 
-        async with pool.acquire() as conn:
-            gid = await ensure_group(conn, message.chat.id)
-            known_members = await list_member_codes(conn, gid)
-            if len(known_members) < 2:
-                await message.reply("Not enough members. Everyone do /join then /me AVC (etc).")
-                return
+    # Parse expense
+    parsed, err = parse_expense_text(text, DEFAULT_MEMBERS)
+    if not parsed:
+        # keep it helpful, not spammy
+        await update.message.reply_text(err)
+        return
 
-            try:
-                parsed = parse_loose_english(text, known_members)
-            except ValueError as e:
-                await message.reply(str(e))
-                return
+    shares = compute_shares(parsed.amount, parsed.participants, parsed.weights)
 
-            payer_row = await get_member_by_code(conn, gid, parsed.payer)
-            if not payer_row or payer_row["is_guest"]:
-                await message.reply(f"Payer '{parsed.payer}' must be a real member. They must /join and /me {parsed.payer}.")
-                return
-            payer_id = payer_row["id"]
+    if DB_POOL is None:
+        # Respond but do not save
+        lines = [
+            f"Expense (NOT SAVED - DB down):",
+            f"- Paid by: {parsed.payer}",
+            f"- Amount: {parsed.amount:.2f} {parsed.currency}",
+            "Shares:",
+        ]
+        for p in parsed.participants:
+            lines.append(f"- {p}: {shares[p]:.2f} {parsed.currency}")
+        await update.message.reply_text("\n".join(lines))
+        return
 
-            # ensure participants exist (create guests if needed)
-            participant_ids: Dict[str, int] = {}
-            for code in parsed.participants:
-                if code.lower().startswith("guest:"):
-                    mid = await get_or_create_guest(conn, gid, code)
-                else:
-                    row = await get_member_by_code(conn, gid, code)
-                    if not row:
-                        await message.reply(f"Member '{code}' not found. They must /join and /me {code}.")
-                        return
-                    mid = row["id"]
-                participant_ids[code] = mid
+    # Save to DB
+    try:
+        exp_id = await db_insert_expense(chat.id, user.id, parsed)
+    except Exception as e:
+        await update.message.reply_text(f"DB error. Could not save. Error: {e}")
+        return
 
-            shares = compute_shares(parsed.amount, parsed.participants, parsed.weights)
+    # Reply summary
+    lines = [
+        f"Saved expense #{exp_id}",
+        f"- Paid by: {parsed.payer}",
+        f"- Amount: {parsed.amount:.2f} {parsed.currency}",
+        "Shares:",
+    ]
+    for p in parsed.participants:
+        w = parsed.weights.get(p, 1.0)
+        w_txt = "" if abs(w - 1.0) < 1e-9 else f" (x{w:g})"
+        lines.append(f"- {p}: {shares[p]:.2f} {parsed.currency}{w_txt}")
 
-            exp_row = await conn.fetchrow(
-                """
-                insert into expenses(group_id, created_by_tg_user_id, payer_member_id, amount, currency, note, raw_text)
-                values($1,$2,$3,$4,'AED',$5,$6)
-                returning id
-                """,
-                gid, message.from_user.id, payer_id, str(parsed.amount), parsed.note, text
-            )
-            exp_id = exp_row["id"]
+    lines.append("\nTip: `undo last` or `undo {id}`")
+    await update.message.reply_text("\n".join(lines))
 
-            for code, share_amt in shares.items():
-                await conn.execute(
-                    """
-                    insert into expense_splits(expense_id, member_id, weight, share_amount)
-                    values($1,$2,$3,$4)
-                    """,
-                    exp_id, participant_ids[code], str(parsed.weights.get(code, AMT("1"))), str(share_amt)
-                )
 
-            net = await compute_net_positions(conn, gid)
-            pays = settlement_suggestions(net)
+# -----------------------------
+# Main
+# -----------------------------
+async def on_startup(app: Application):
+    # DB init should not crash the bot
+    await init_db_pool()
 
-        lines = [f"Expense #{exp_id} logged: {parsed.amount} AED"]
-        lines.append(f"Paid by: {parsed.payer}")
-        lines.append("Shares:")
-        for n in parsed.participants:
-            lines.append(f"- {n}: {shares[n]} AED")
 
-        if pays:
-            lines.append("Suggested settlements:")
-            for d, c, x in pays[:6]:
-                lines.append(f"- {d} -> {c}: {x} AED")
-            if len(pays) > 6:
-                lines.append(f"(+{len(pays)-6} more)")
-        else:
-            lines.append("All settled.")
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
-        await message.reply("\n".join(lines))
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    await dp.start_polling(Bot(TOKEN))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("balance", cmd_balance))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Start DB init but do not block bot startup
+    application.post_init = on_startup
+
+    application.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
